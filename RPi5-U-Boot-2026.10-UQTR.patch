@@ -1,0 +1,2252 @@
+diff --git a/arch/sandbox/dts/test.dts b/arch/sandbox/dts/test.dts
+--- a/arch/sandbox/dts/test.dts
++++ b/arch/sandbox/dts/test.dts
+@@ -664,6 +664,15 @@
+ 		subnode@0 {
+ 			compatible = "denx,u-boot-fdt-test";
+ 		};
++		bus@7 {
++			#address-cells = <1>;
++			#size-cells = <1>;
++			compatible = "denx,u-boot-test-bus";
++
++			subnode@8 {
++				  compatible = "denx,u-boot-fdt-test";
++			};
++		};
+ 	};
+ 
+ 	mmio-bus@1 {
+diff --git a/board/raspberrypi/rpi/Kconfig b/board/raspberrypi/rpi/Kconfig
+--- a/board/raspberrypi/rpi/Kconfig
++++ b/board/raspberrypi/rpi/Kconfig
+@@ -1,5 +1,12 @@
+ if SYS_BOARD = "rpi"
+ 
++config RPI5_HDMI_DIAG
++	bool "Temporary Pi 5 direct HDMI startup diagnostics"
++	depends on TARGET_RPI_ARM64 && VIDEO
++	help
++	  Write startup checkpoints directly to the framebuffer console and
++	  use HDMI-only standard output. For diagnosing Pi 5 without a UART.
++
+ config RPI_EFI_NR_SPIN_PAGES
+ 	int "Spin table page count"
+ 	default 1
+diff --git a/board/raspberrypi/rpi/rpi.c b/board/raspberrypi/rpi/rpi.c
+--- a/board/raspberrypi/rpi/rpi.c
++++ b/board/raspberrypi/rpi/rpi.c
+@@ -5,6 +5,7 @@
+ 
+ #define LOG_CATEGORY	LOGC_BOARD
+ 
++#include <rpi5_diag.h>
+ #include <config.h>
+ #include <dm.h>
+ #include <env.h>
+@@ -566,6 +567,28 @@
+ 	return bcm2835_power_on_module(BCM2835_MBOX_POWER_DEVID_USB_HCD);
+ }
+ 
++int board_late_init(void)
++{
++	struct udevice *dev;
++	int err;
++
++	rpi5_diag("RP1 PCI find/probe");
++	err = dm_pci_find_device(PCI_VENDOR_ID_RPI, PCI_DEVICE_ID_RPI_RP1_C0,
++				 0, &dev);
++	rpi5_diag_result("RP1 find/probe returned", err);
++	if (err) {
++		printf("RPI: RP1 device not found\n");
++	} else {
++		rpi5_diag("RP1 child scan");
++		err = dm_scan_fdt_dev(dev);
++		rpi5_diag_result("RP1 child scan returned", err);
++		if (err)
++			printf("RPI: RP1 child scan failed: %d\n", err);
++	}
++
++	return 0;
++}
++
+ /*
+  * If the firmware passed a device tree use it for U-Boot.
+  */
+diff --git a/board/raspberrypi/rpi/rpi.env b/board/raspberrypi/rpi/rpi.env
+--- a/board/raspberrypi/rpi/rpi.env
++++ b/board/raspberrypi/rpi/rpi.env
+@@ -6,8 +6,13 @@
+ 
+ /* Environment */
+ stdin=serial,usbkbd
++#ifdef CONFIG_RPI5_HDMI_DIAG
++stdout=vidconsole
++stderr=vidconsole
++#else
+ stdout=serial,vidconsole
+ stderr=serial,vidconsole
++#endif
+ 
+ /* DFU over USB/UDC */
+ #ifdef CONFIG_CMD_DFU
+diff --git a/board/raspberrypi/rpi/rpi5_diag.c b/board/raspberrypi/rpi/rpi5_diag.c
+new file mode 100644
+--- /dev/null
++++ b/board/raspberrypi/rpi/rpi5_diag.c
+@@ -0,0 +1,161 @@
++// SPDX-License-Identifier: GPL-2.0+
++/* Pi 5 raw framebuffer diagnostics. No fonts, stdio or video_sync(). */
++#include <cpu_func.h>
++#include <dm.h>
++#include <rpi5_diag.h>
++#include <video.h>
++#include <linux/string.h>
++#include <asm/cache.h>
++#include <asm/global_data.h>
++
++DECLARE_GLOBAL_DATA_PTR;
++static struct udevice *diag_video;
++
++/* draw_panel() bounds-checks the whole panel before these pixel writes. */
++static void rect(struct video_priv *p, int x, int y, int w, int h, u32 color)
++{
++	int row, col;
++
++	for (row = y; row < y + h; row++) {
++		volatile u32 *dst = (void *)((u8 *)p->fb +
++					   row * p->line_length + x * 4);
++
++		for (col = 0; col < w; col++)
++			dst[col] = color;
++	}
++}
++
++/* Seven segments drawn as rectangles: independent of the text console. */
++static void digit(struct video_priv *p, int x, int y, unsigned int n)
++{
++	static const u8 masks[] = {
++		0x3f, 0x06, 0x5b, 0x4f, 0x66,
++		0x6d, 0x7d, 0x07, 0x7f, 0x6f
++	};
++	static const u8 box[7][4] = {
++		{8, 0, 32, 8}, {40, 8, 8, 32}, {40, 48, 8, 32},
++		{8, 80, 32, 8}, {0, 48, 8, 32}, {0, 8, 8, 32},
++		{8, 40, 32, 8}
++	};
++	unsigned int i;
++
++	for (i = 0; i < 7; i++)
++		if (masks[n % 10] & (1U << i))
++			rect(p, x + box[i][0], y + box[i][1],
++			     box[i][2], box[i][3], 0xffffffff);
++}
++
++static void draw_panel(struct udevice *dev, unsigned int code, int result)
++{
++	struct video_priv *p = dev_get_uclass_priv(dev);
++	unsigned long start, end;
++	unsigned int rc = result < 0 ? -(unsigned int)result : result;
++
++	/* Targets the mailbox driver's requested 32-bit framebuffer. */
++	if (!p->fb || p->bpix != VIDEO_BPP32 || p->xsize < 416 ||
++	    p->ysize < 136 || p->line_length < p->xsize * 4 ||
++	    (unsigned long)p->line_length * 136 > p->fb_size)
++		return;
++
++	rect(p, 8, 8, 408, 128, 0xffffffff);
++	rect(p, 12, 12, 400, 120, 0xff202020);
++	digit(p, 24, 28, code / 100);
++	digit(p, 80, 28, code / 10);
++	digit(p, 136, 28, code);
++	/* Right digits are absolute return value modulo 1000; bar = negative. */
++	digit(p, 232, 28, rc / 100);
++	digit(p, 288, 28, rc / 10);
++	digit(p, 344, 28, rc);
++	if (result < 0)
++		rect(p, 204, 68, 20, 8, 0xffffffff);
++	/* Small dot is white after relocation, black before relocation. */
++	rect(p, 24, 120, 8, 8,
++	     gd->flags & GD_FLG_RELOC ? 0xffffffff : 0xff000000);
++
++	/* Explicit cache flush: no timers, callbacks or console access. */
++	start = (unsigned long)p->fb & ~(ARCH_DMA_MINALIGN - 1UL);
++	end = ALIGN((unsigned long)p->fb + p->line_length * 136,
++		    ARCH_DMA_MINALIGN);
++	flush_dcache_range(start, end);
++}
++
++void rpi5_diag_video(struct udevice *video, unsigned int stage)
++{
++	draw_panel(video, stage, 0);
++	/* Do not retain pointers or write BSS state before relocation. */
++	if (gd->flags & GD_FLG_RELOC)
++		diag_video = video;
++}
++
++void rpi5_diag_attach(struct udevice *console)
++{
++	rpi5_diag_video(console->parent, 304);
++}
++
++struct checkpoint {
++	const char *message;
++	unsigned int code;
++};
++
++static const struct checkpoint checkpoints[] = {
++	{"Logo draw finished", 306},
++	{"Enter console_init_r", 310},
++	{"Leave console_init_r", 311},
++	{"Enter misc_init_r", 312},
++	{"Leave misc_init_r", 313},
++	{"Enter interrupt_init", 314},
++	{"Leave interrupt_init", 315},
++	{"Enter board_late_init", 320},
++	{"RP1 PCI find/probe", 321},
++	{"RP1 PCI command / BAR setup", 322},
++	{"RP1 map BAR", 323},
++	{"RP1 read chip ID", 324},
++	{"RP1 read platform", 325},
++	{"RP1 register reads finished", 326},
++	{"RP1 find/probe returned", 327},
++	{"RP1 child scan", 328},
++	{"RP1 child scan returned", 329},
++	{"Leave board_late_init", 330},
++	{"Enter initr_net", 340},
++	{"MACB probe entered", 341},
++	{"MACB read capabilities", 342},
++	{"MACB enable clocks", 343},
++	{"MACB clocks returned", 344},
++	{"MACB PHY GPIO reset", 345},
++	{"MACB PHY reset returned", 346},
++	{"MACB hardware init", 347},
++	{"MACB hardware init returned", 348},
++	{"MACB MDIO registration", 349},
++	{"MACB MDIO returned", 350},
++	{"Leave initr_net", 351},
++	{"Main loop reached", 360},
++	{"Preboot: PCI / USB start", 361},
++	{"USB init entered", 370},
++	{"USB controller probe", 371},
++	{"USB controller probe returned", 372},
++	{"USB device scan", 373},
++	{"USB device scan returned", 374},
++	{"USB init returned", 375},
++	{"Preboot finished", 380},
++	{"Entering command prompt", 390},
++};
++
++void rpi5_diag_result(const char *message, int result)
++{
++	unsigned int i, code = 399;
++
++	if (!(gd->flags & GD_FLG_RELOC) || !diag_video)
++		return;
++	for (i = 0; i < ARRAY_SIZE(checkpoints); i++) {
++		if (!strcmp(message, checkpoints[i].message)) {
++			code = checkpoints[i].code;
++			break;
++		}
++	}
++	draw_panel(diag_video, code, result);
++}
++
++void rpi5_diag(const char *message)
++{
++	rpi5_diag_result(message, 0);
++}
+diff --git a/common/board_r.c b/common/board_r.c
+--- a/common/board_r.c
++++ b/common/board_r.c
+@@ -9,6 +9,7 @@
+  * Marius Groeger <mgroeger@sysgo.de>
+  */
+ 
++#include <rpi5_diag.h>
+ #include <config.h>
+ #include <api.h>
+ #include <bootstage.h>
+@@ -731,7 +732,9 @@
+ #if CONFIG_IS_ENABLED(API)
+ 	INITCALL(api_init);
+ #endif
+-	INITCALL(console_init_r);	/* fully init console as a device */
++	rpi5_diag("Enter console_init_r");
++	INITCALL(console_init_r);
++	rpi5_diag("Leave console_init_r");	/* fully init console as a device */
+ #if CONFIG_IS_ENABLED(DISPLAY_BOARDINFO_LATE)
+ 	INITCALL(console_announce_r);
+ 	INITCALL(show_board_info);
+@@ -742,27 +745,35 @@
+ #endif
+ 	/* miscellaneous platform-dependent init */
+ #if CONFIG_IS_ENABLED(MISC_INIT_R)
++	rpi5_diag("Enter misc_init_r");
+ 	INITCALL(misc_init_r);
++	rpi5_diag("Leave misc_init_r");
+ #endif
+ 	WATCHDOG_RESET();
+ #if CONFIG_IS_ENABLED(CMD_KGDB)
+ 	INITCALL(kgdb_init);
+ #endif
++	rpi5_diag("Enter interrupt_init");
+ 	INITCALL(interrupt_init);
++	rpi5_diag("Leave interrupt_init");
+ #if defined(CONFIG_MICROBLAZE) || defined(CONFIG_M68K)
+ 	INITCALL(timer_init);		/* initialize timer */
+ #endif
+ 	INITCALL(initr_boot_led_blink);
+ 	/* PPC has a udelay(20) here dating from 2002. Why? */
+ #if CONFIG_IS_ENABLED(BOARD_LATE_INIT)
++	rpi5_diag("Enter board_late_init");
+ 	INITCALL(board_late_init);
++	rpi5_diag("Leave board_late_init");
+ #endif
+ #if CONFIG_IS_ENABLED(PCI_ENDPOINT)
+ 	INITCALL(pci_ep_init);
+ #endif
+ #if CONFIG_IS_ENABLED(NET)
+ 	WATCHDOG_RESET();
++	rpi5_diag("Enter initr_net");
+ 	INITCALL(initr_net);
++	rpi5_diag("Leave initr_net");
+ #endif
+ #if CONFIG_IS_ENABLED(POST)
+ 	INITCALL(initr_post);
+diff --git a/common/main.c b/common/main.c
+--- a/common/main.c
++++ b/common/main.c
+@@ -6,6 +6,7 @@
+ 
+ /* #define	DEBUG	*/
+ 
++#include <rpi5_diag.h>
+ #include <autoboot.h>
+ #include <button.h>
+ #include <bootstage.h>
+@@ -49,10 +50,13 @@
+ 	if (IS_ENABLED(CONFIG_VERSION_VARIABLE))
+ 		env_set("ver", version_string);  /* set version variable */
+ 
++	rpi5_diag("Main loop reached");
+ 	cli_init();
+ 
++	rpi5_diag("Preboot: PCI / USB start");
+ 	if (IS_ENABLED(CONFIG_USE_PREBOOT))
+ 		run_preboot_environment_command();
++	rpi5_diag("Preboot finished");
+ 
+ 	if (event_notify_null(EVT_POST_PREBOOT))
+ 		return;
+@@ -83,6 +87,7 @@
+ 		panic("Failed to boot");
+ 	}
+ 
++	rpi5_diag("Entering command prompt");
+ 	cli_loop();
+ 
+ 	panic("No CLI available");
+diff --git a/configs/rpi_arm64_defconfig b/configs/rpi_arm64_defconfig
+--- a/configs/rpi_arm64_defconfig
++++ b/configs/rpi_arm64_defconfig
+@@ -15,10 +15,14 @@ CONFIG_BOOTSTD_DEFAULTS=y
+ CONFIG_OF_BOARD_SETUP=y
+ CONFIG_FDT_SIMPLEFB=y
+ CONFIG_USE_PREBOOT=y
++CONFIG_BOOTDELAY=-1
++CONFIG_RPI5_HDMI_DIAG=y
++CONFIG_LOCALVERSION="-rpi5-uqtr"
+ CONFIG_PREBOOT="pci enum; usb start;"
+ CONFIG_SYS_PBSIZE=1049
+ # CONFIG_DISPLAY_CPUINFO is not set
+ # CONFIG_DISPLAY_BOARDINFO is not set
++CONFIG_BOARD_LATE_INIT=y
+ CONFIG_MISC_INIT_R=y
+ CONFIG_SYS_PROMPT="U-Boot> "
+ CONFIG_CMD_NVEDIT_EFI=y
+@@ -31,18 +35,26 @@ CONFIG_WGET_HTTPS=y
+ CONFIG_CMD_EFIDEBUG=y
+ CONFIG_CMD_FS_UUID=y
+ CONFIG_ENV_FAT_DEVICE_AND_PART="0:1"
++# CONFIG_ENV_IS_IN_FAT is not set
++CONFIG_ENV_IS_NOWHERE=y
+ CONFIG_ENV_VARS_UBOOT_RUNTIME_CONFIG=y
+ CONFIG_NET_LWIP=y
+ CONFIG_DM_DMA=y
++CONFIG_CLK=y
++CONFIG_CLK_RP1=y
+ CONFIG_DFU_MMC=y
+ CONFIG_SYS_DFU_DATA_BUF_SIZE=0x100000
+ CONFIG_SYS_DFU_MAX_FILE_SIZE=0x200000
+ CONFIG_BCM2835_GPIO=y
++CONFIG_RP1_GPIO=y
++CONFIG_MFD_RP1=y
+ CONFIG_MMC_SDHCI=y
+ CONFIG_MMC_SDHCI_SDMA=y
+ CONFIG_MMC_SDHCI_BCM2835=y
+ CONFIG_MMC_SDHCI_BCMSTB=y
+ CONFIG_BCMGENET=y
++CONFIG_MACB=y
++CONFIG_NVME_PCI=y
+ CONFIG_PCI_BRCMSTB=y
+ CONFIG_PINCTRL=y
+ # CONFIG_PINCTRL_GENERIC is not set
+@@ -55,15 +67,19 @@ CONFIG_SYSINFO=y
+ CONFIG_SYSINFO_SMBIOS=y
+ CONFIG_USB=y
+ CONFIG_USB_XHCI_HCD=y
++CONFIG_USB_XHCI_DWC3=y
+ CONFIG_USB_XHCI_PCI=y
+ CONFIG_USB_DWC2=y
++CONFIG_USB_DWC3=y
+ CONFIG_USB_KEYBOARD=y
+ CONFIG_USB_HOST_ETHER=y
+ CONFIG_USB_ETHER_LAN78XX=y
+ CONFIG_USB_ETHER_SMSC95XX=y
+ CONFIG_VIDEO=y
+ # CONFIG_VIDEO_BPP8 is not set
+-# CONFIG_VIDEO_BPP16 is not set
++CONFIG_VIDEO_BPP16=y
++CONFIG_VIDEO_LOGO=y
++# CONFIG_VIDEO_COPY is not set
+ CONFIG_SYS_WHITE_ON_BLACK=y
+ CONFIG_VIDEO_BCM2835=y
+ CONFIG_CONSOLE_SCROLL_LINES=10
+diff --git a/drivers/clk/Kconfig b/drivers/clk/Kconfig
+--- a/drivers/clk/Kconfig
++++ b/drivers/clk/Kconfig
+@@ -188,6 +188,13 @@
+ 	help
+ 	  Enable this to support the clocks on Octeon MIPS platforms.
+ 
++config CLK_RP1
++	bool "Raspberry Pi RP1-based clock support"
++	depends on PCI && CLK
++	help
++	  Enable common clock framework support for Raspberry Pi RP1
++	  support.
++
+ config SANDBOX_CLK_CCF
+ 	bool "Sandbox Common Clock Framework [CCF] support"
+ 	depends on SANDBOX
+diff --git a/drivers/clk/Makefile b/drivers/clk/Makefile
+--- a/drivers/clk/Makefile
++++ b/drivers/clk/Makefile
+@@ -63,3 +63,4 @@
+ obj-$(CONFIG_SANDBOX_CLK_CCF) += clk_sandbox_ccf.o
+ obj-$(CONFIG_SANDBOX) += clk_sandbox.o
+ obj-$(CONFIG_SANDBOX) += clk_sandbox_test.o
++obj-$(CONFIG_CLK_RP1) += clk-rp1.o
+diff --git a/drivers/clk/clk-rp1.c b/drivers/clk/clk-rp1.c
+new file mode 100644
+--- /dev/null
++++ b/drivers/clk/clk-rp1.c
+@@ -0,0 +1,280 @@
++// SPDX-License-Identifier: GPL-2.0+
++/*
++ * Clock driver for RP1 PCIe multifunction chip.
++ *
++ * Copyright (C) 2024 EPAM Systems
++ *
++ * Derived from linux clk-rp1 driver
++ *   Copyright (C) 2023 Raspberry Pi Ltd.
++ */
++
++#include <clk.h>
++#include <clk-uclass.h>
++#include <dm.h>
++#include <errno.h>
++#include <asm/io.h>
++#include <linux/bitops.h>
++#include <linux/clk-provider.h>
++#include <linux/math64.h>
++
++#include <dt-bindings/clk/rp1.h>
++
++#define GPCLK_OE_CTRL			0x00000
++
++#define CLK_ETH_TSU_CTRL		0x00134
++#define CLK_ETH_TSU_DIV_INT		0x00138
++#define CLK_ETH_TSU_SEL			0x00140
++
++#define FC_NUM(idx, off)		((idx) * 32 + (off))
++
++#define DIV_INT_8BIT_MAX		0x000000ffu /* max divide for most clocks */
++
++/* Clock fields for all clocks */
++#define CLK_CTRL_ENABLE			BIT(11)
++#define CLK_DIV_FRAC_BITS		16
++
++#define KHz				1000
++#define MHz				(KHz * KHz)
++
++#define MAX_CLK_PARENTS	16
++#define DIV_U64_NEAREST(a, b) div_u64(((a) + ((b) >> 1)), (b))
++
++struct rp1_clockman {
++	struct udevice *dev;
++	void __iomem *regs;
++	spinlock_t regs_lock; /* spinlock for all clocks */
++};
++
++struct rp1_pll_core_data {
++	const char *name;
++	u32 cs_reg;
++	u32 pwr_reg;
++	u32 fbdiv_int_reg;
++	u32 fbdiv_frac_reg;
++	unsigned long flags;
++	u32 fc0_src;
++};
++
++struct rp1_pll_data {
++	const char *name;
++	const char *source_pll;
++	u32 ctrl_reg;
++	unsigned long flags;
++	u32 fc0_src;
++};
++
++struct rp1_pll_ph_data {
++	const char *name;
++	const char *source_pll;
++	unsigned int phase;
++	unsigned int fixed_divider;
++	u32 ph_reg;
++	unsigned long flags;
++	u32 fc0_src;
++};
++
++struct rp1_pll_divider_data {
++	const char *name;
++	const char *source_pll;
++	u32 sec_reg;
++	unsigned long flags;
++	u32 fc0_src;
++};
++
++struct rp1_clock_data {
++	const char *name;
++	const char *const parents[MAX_CLK_PARENTS];
++	int num_std_parents;
++	int num_aux_parents;
++	unsigned long flags;
++	u32 oe_mask;
++	u32 clk_src_mask;
++	u32 ctrl_reg;
++	u32 div_int_reg;
++	u32 div_frac_reg;
++	u32 sel_reg;
++	u32 div_int_max;
++	unsigned long max_freq;
++	u32 fc0_src;
++};
++
++struct rp1_pll_core {
++	struct clk hw;
++	struct rp1_clockman *clockman;
++	const struct rp1_pll_core_data *data;
++	unsigned long cached_rate;
++};
++
++struct rp1_pll {
++	struct clk hw;
++	struct clk_divider div;
++	struct rp1_clockman *clockman;
++	const struct rp1_pll_data *data;
++	unsigned long cached_rate;
++};
++
++struct rp1_pll_ph {
++	struct clk hw;
++	struct rp1_clockman *clockman;
++	const struct rp1_pll_ph_data *data;
++};
++
++struct rp1_clock {
++	struct clk hw;
++	struct rp1_clockman *clockman;
++	const struct rp1_clock_data *data;
++	unsigned long cached_rate;
++};
++
++struct rp1_clk_change {
++	struct clk *hw;
++	unsigned long new_rate;
++};
++
++struct rp1_clk_change rp1_clk_chg_tree[3];
++
++static inline
++void clockman_write(struct rp1_clockman *clockman, u32 reg, u32 val)
++{
++	writel(val, clockman->regs + reg);
++}
++
++static inline u32 clockman_read(struct rp1_clockman *clockman, u32 reg)
++{
++	return readl(clockman->regs + reg);
++}
++
++static struct rp1_clock_data rp1_data[] = {
++[RP1_CLK_ETH_TSU] = {
++			.name = "clk_eth_tsu",
++			.parents = {"xosc",
++				    "pll_video_sec",
++				    "clksrc_gp0",
++				    "clksrc_gp1",
++				    "clksrc_gp2",
++				    "clksrc_gp3",
++				    "clksrc_gp4",
++				    "clksrc_gp5"},
++			.num_std_parents = 0,
++			.num_aux_parents = 8,
++			.ctrl_reg = CLK_ETH_TSU_CTRL,
++			.div_int_reg = CLK_ETH_TSU_DIV_INT,
++			.div_frac_reg = 0,
++			.sel_reg = CLK_ETH_TSU_SEL,
++			.div_int_max = DIV_INT_8BIT_MAX,
++			.max_freq = 50 * MHz,
++			.fc0_src = FC_NUM(5, 7),
++	},
++};
++
++static u32 rp1_clock_choose_div(unsigned long rate, unsigned long parent_rate,
++				const struct rp1_clock_data *data)
++{
++	u64 div;
++
++	/*
++	 * Due to earlier rounding, calculated parent_rate may differ from
++	 * expected value. Don't fail on a small discrepancy near unity divide.
++	 */
++	if (!rate || rate > parent_rate + (parent_rate >> CLK_DIV_FRAC_BITS))
++		return 0;
++
++	/*
++	 * Always express div in fixed-point format for fractional division;
++	 * If no fractional divider is present, the fraction part will be zero.
++	 */
++	if (data->div_frac_reg) {
++		div = (u64)parent_rate << CLK_DIV_FRAC_BITS;
++		div = DIV_U64_NEAREST(div, rate);
++	} else {
++		div = DIV_U64_NEAREST(parent_rate, rate);
++		div <<= CLK_DIV_FRAC_BITS;
++	}
++
++	div = clamp(div,
++		    1ull << CLK_DIV_FRAC_BITS,
++		    (u64)data->div_int_max << CLK_DIV_FRAC_BITS);
++
++	return div;
++}
++
++static ulong rp1_clock_set_rate(struct clk *hw, unsigned long rate)
++{
++	struct rp1_clockman *clockman = dev_get_priv(hw->dev);
++	const struct rp1_clock_data *data = &rp1_data[hw->id];
++	u32 div = rp1_clock_choose_div(rate, 0x2faf080, data);
++
++	if (hw->id != RP1_CLK_ETH_TSU)
++		return 0;
++
++	WARN(rate > 4000000000ll, "rate is -ve (%d)\n", (int)rate);
++
++	if (WARN(!div,
++		 "clk divider calculated as 0! (%s, rate %ld, parent rate %d)\n",
++		 data->name, rate, 0x2faf080))
++		div = 1 << CLK_DIV_FRAC_BITS;
++
++	spin_lock(&clockman->regs_lock);
++
++	clockman_write(clockman, data->div_int_reg, div >> CLK_DIV_FRAC_BITS);
++	if (data->div_frac_reg)
++		clockman_write(clockman, data->div_frac_reg, div << (32 - CLK_DIV_FRAC_BITS));
++
++	spin_unlock(&clockman->regs_lock);
++
++	return 0;
++}
++
++static int rp1_clock_on(struct clk *hw)
++{
++	const struct rp1_clock_data *data = &rp1_data[hw->id];
++	struct rp1_clockman *clockman = dev_get_priv(hw->dev);
++
++	if (hw->id != RP1_CLK_ETH_TSU)
++		return 0;
++
++	spin_lock(&clockman->regs_lock);
++	clockman_write(clockman, data->ctrl_reg,
++		       clockman_read(clockman, data->ctrl_reg) | CLK_CTRL_ENABLE);
++	/* If this is a GPCLK, turn on the output-enable */
++	if (data->oe_mask)
++		clockman_write(clockman, GPCLK_OE_CTRL,
++			       clockman_read(clockman, GPCLK_OE_CTRL) | data->oe_mask);
++
++	spin_unlock(&clockman->regs_lock);
++
++	return 0;
++}
++
++static int rp1_clk_probe(struct udevice *dev)
++{
++	struct rp1_clockman *clockman = dev_get_priv(dev);
++
++	spin_lock_init(&clockman->regs_lock);
++
++	clockman->regs = dev_remap_addr(dev);
++	if (!clockman->regs)
++		return -EINVAL;
++
++	return 0;
++}
++
++static const struct udevice_id rp1_clk_of_match[] = {
++	{ .compatible = "raspberrypi,rp1-clocks" },
++	{ /* sentinel */ }
++};
++
++static struct clk_ops rp1_clk_ops = {
++	.set_rate = rp1_clock_set_rate,
++	.enable = rp1_clock_on,
++};
++
++U_BOOT_DRIVER(clk_rp1) = {
++	.name = "rp1-clk",
++	.id = UCLASS_CLK,
++	.of_match = rp1_clk_of_match,
++	.probe = rp1_clk_probe,
++	.ops = &rp1_clk_ops,
++	.priv_auto	= sizeof(struct rp1_clockman),
++	.flags = CLK_IGNORE_UNUSED,
++};
+diff --git a/drivers/core/device.c b/drivers/core/device.c
+--- a/drivers/core/device.c
++++ b/drivers/core/device.c
+@@ -459,7 +459,19 @@
+ 	u64 size = 0;
+ 	int ret;
+ 
+-	if (!CONFIG_IS_ENABLED(DM_DMA) || !parent || !dev_has_ofnode(parent))
++	if (!CONFIG_IS_ENABLED(DM_DMA) || !parent)
++		return 0;
++
++	/* Look for the first node in the parent chain */
++	while (parent) {
++		if (dev_has_ofnode(parent))
++			break;
++
++		parent = dev_get_parent(parent);
++	}
++
++	/* No parents have a node, bail out */
++	if (!parent)
+ 		return 0;
+ 
+ 	/*
+diff --git a/drivers/gpio/Kconfig b/drivers/gpio/Kconfig
+--- a/drivers/gpio/Kconfig
++++ b/drivers/gpio/Kconfig
+@@ -413,6 +413,13 @@
+ 	help
+ 	  This driver supports the GPIO banks on Renesas R-Car SoCs.
+ 
++config RP1_GPIO
++	bool "Raspberry PR1 GPIO driver"
++	help
++	  This driver supports the GPIO banks on Raspberry RP1 chip.
++	  Raspberry PI5 has an external chip RP1 installed, which
++	  provides it's own GPIO controller.
++
+ config RZA1_GPIO
+ 	bool "Renesas RZ/A1 GPIO driver"
+ 	depends on DM_GPIO && RZA1
+diff --git a/drivers/gpio/Makefile b/drivers/gpio/Makefile
+--- a/drivers/gpio/Makefile
++++ b/drivers/gpio/Makefile
+@@ -35,6 +35,7 @@
+ obj-$(CONFIG_PCA953X)		+= pca953x.o
+ obj-$(CONFIG_ROCKCHIP_GPIO)	+= rk_gpio.o
+ obj-$(CONFIG_RCAR_GPIO)		+= gpio-rcar.o
++obj-$(CONFIG_RP1_GPIO)		+= rp1_gpio.o
+ obj-$(CONFIG_RZA1_GPIO)		+= gpio-rza1.o
+ obj-$(CONFIG_S5P)		+= s5p_gpio.o
+ obj-$(CONFIG_SANDBOX_GPIO)	+= sandbox.o sandbox_test.o
+diff --git a/drivers/gpio/rp1_gpio.c b/drivers/gpio/rp1_gpio.c
+new file mode 100644
+--- /dev/null
++++ b/drivers/gpio/rp1_gpio.c
+@@ -0,0 +1,374 @@
++// SPDX-License-Identifier: GPL-2.0+
++/*
++ * Copyright (C) 2024 EPAM Systems
++ *
++ * Derived from linux/drivers/pinctrl/pinctl-rp1.c
++ * Copyright (C) 2023 Raspberry Pi Ltd.
++ */
++
++#include <dm.h>
++#include <errno.h>
++#include <asm/gpio.h>
++#include <asm/io.h>
++#include <linux/bitops.h>
++
++#define RP1_NUM_GPIOS	54
++#define RP1_NUM_BANKS	3
++
++#define RP1_RW_OFFSET			0x0000
++#define RP1_XOR_OFFSET			0x1000
++#define RP1_SET_OFFSET			0x2000
++#define RP1_CLR_OFFSET			0x3000
++
++#define RP1_GPIO_STATUS			0x0000
++#define RP1_GPIO_CTRL			0x0004
++
++#define RP1_GPIO_PCIE_INTE		0x011c
++#define RP1_GPIO_PCIE_INTS		0x0124
++
++#define RP1_GPIO_EVENTS_SHIFT_RAW	20
++#define RP1_GPIO_STATUS_FALLING		BIT(20)
++#define RP1_GPIO_STATUS_RISING		BIT(21)
++#define RP1_GPIO_STATUS_LOW		BIT(22)
++#define RP1_GPIO_STATUS_HIGH		BIT(23)
++
++#define RP1_GPIO_EVENTS_SHIFT_FILTERED	24
++#define RP1_GPIO_STATUS_F_FALLING	BIT(24)
++#define RP1_GPIO_STATUS_F_RISING	BIT(25)
++#define RP1_GPIO_STATUS_F_LOW		BIT(26)
++#define RP1_GPIO_STATUS_F_HIGH		BIT(27)
++
++#define RP1_GPIO_CTRL_FUNCSEL_LSB	0
++#define RP1_GPIO_CTRL_FUNCSEL_MASK	0x0000001f
++#define RP1_GPIO_CTRL_OUTOVER_LSB	12
++#define RP1_GPIO_CTRL_OUTOVER_MASK	0x00003000
++#define RP1_GPIO_CTRL_OEOVER_LSB	14
++#define RP1_GPIO_CTRL_OEOVER_MASK	0x0000c000
++#define RP1_GPIO_CTRL_INOVER_LSB	16
++#define RP1_GPIO_CTRL_INOVER_MASK	0x00030000
++#define RP1_GPIO_CTRL_IRQEN_FALLING	BIT(20)
++#define RP1_GPIO_CTRL_IRQEN_RISING	BIT(21)
++#define RP1_GPIO_CTRL_IRQEN_LOW		BIT(22)
++#define RP1_GPIO_CTRL_IRQEN_HIGH	BIT(23)
++#define RP1_GPIO_CTRL_IRQEN_F_FALLING	BIT(24)
++#define RP1_GPIO_CTRL_IRQEN_F_RISING	BIT(25)
++#define RP1_GPIO_CTRL_IRQEN_F_LOW	BIT(26)
++#define RP1_GPIO_CTRL_IRQEN_F_HIGH	BIT(27)
++#define RP1_GPIO_CTRL_IRQRESET		BIT(28)
++#define RP1_GPIO_CTRL_IRQOVER_LSB	30
++#define RP1_GPIO_CTRL_IRQOVER_MASK	0xc0000000
++
++#define RP1_PUD_OFF			0
++#define RP1_PUD_DOWN			1
++#define RP1_PUD_UP			2
++
++#define RP1_FSEL_COUNT			9
++
++#define RP1_FSEL_ALT0			0x00
++#define RP1_FSEL_GPIO			0x05
++#define RP1_FSEL_NONE			0x09
++#define RP1_FSEL_NONE_HW		0x1f
++
++#define RP1_DIR_OUTPUT			0
++#define RP1_DIR_INPUT			1
++
++#define RP1_OUTOVER_PERI		0
++#define RP1_OUTOVER_INVPERI		1
++#define RP1_OUTOVER_LOW			2
++#define RP1_OUTOVER_HIGH		3
++
++#define RP1_OEOVER_PERI			0
++#define RP1_OEOVER_INVPERI		1
++#define RP1_OEOVER_DISABLE		2
++#define RP1_OEOVER_ENABLE		3
++
++#define RP1_INOVER_PERI			0
++#define RP1_INOVER_INVPERI		1
++#define RP1_INOVER_LOW			2
++#define RP1_INOVER_HIGH			3
++
++#define RP1_RIO_OUT			0x00
++#define RP1_RIO_OE			0x04
++#define RP1_RIO_IN			0x08
++
++#define RP1_PAD_SLEWFAST_MASK		0x00000001
++#define RP1_PAD_SLEWFAST_LSB		0
++#define RP1_PAD_SCHMITT_MASK		0x00000002
++#define RP1_PAD_SCHMITT_LSB		1
++#define RP1_PAD_PULL_MASK		0x0000000c
++#define RP1_PAD_PULL_LSB		2
++#define RP1_PAD_DRIVE_MASK		0x00000030
++#define RP1_PAD_DRIVE_LSB		4
++#define RP1_PAD_IN_ENABLE_MASK		0x00000040
++#define RP1_PAD_IN_ENABLE_LSB		6
++#define RP1_PAD_OUT_DISABLE_MASK	0x00000080
++#define RP1_PAD_OUT_DISABLE_LSB		7
++
++#define RP1_PAD_DRIVE_2MA		0x00000000
++#define RP1_PAD_DRIVE_4MA		0x00000010
++#define RP1_PAD_DRIVE_8MA		0x00000020
++#define RP1_PAD_DRIVE_12MA		0x00000030
++
++#define FLD_GET(r, f) (((r) & (f ## _MASK)) >> (f ## _LSB))
++#define FLD_SET(r, f, v) r = (((r) & ~(f ## _MASK)) | ((v) << (f ## _LSB)))
++
++struct rp1_iobank_desc {
++	int min_gpio;
++	int num_gpios;
++	int gpio_offset;
++	int inte_offset;
++	int ints_offset;
++	int rio_offset;
++	int pads_offset;
++};
++
++const struct rp1_iobank_desc rp1_iobanks[RP1_NUM_BANKS] = {
++	/*         gpio   inte    ints     rio    pads */
++	{  0, 28, 0x0000, 0x011c, 0x0124, 0x0000, 0x0004 },
++	{ 28,  6, 0x4000, 0x411c, 0x4124, 0x4000, 0x4004 },
++	{ 34, 20, 0x8000, 0x811c, 0x8124, 0x8000, 0x8004 },
++};
++
++struct rp1_pin_info {
++	u8 num;
++	u8 bank;
++	u8 offset;
++	u8 fsel;
++
++	void __iomem *gpio;
++	void __iomem *rio;
++	void __iomem *inte;
++	void __iomem *ints;
++	void __iomem *pad;
++};
++
++struct rp1_gpio_priv {
++	void __iomem *gpio_base;
++	void __iomem *rio_base;
++	void __iomem *pads_base;
++
++	struct rp1_pin_info pins[RP1_NUM_GPIOS];
++};
++
++static struct rp1_pin_info *rp1_get_pin(struct udevice *dev,
++					unsigned int offset)
++{
++	struct rp1_gpio_priv *priv = dev_get_priv(dev);
++
++	if (priv && offset < RP1_NUM_GPIOS)
++		return &priv->pins[offset];
++
++	return NULL;
++}
++
++static void rp1_pad_update(struct rp1_pin_info *pin, u32 clr, u32 set)
++{
++	u32 padctrl = readl(pin->pad);
++
++	padctrl &= ~clr;
++	padctrl |= set;
++
++	writel(padctrl, pin->pad);
++}
++
++static void rp1_input_enable(struct rp1_pin_info *pin, int value)
++{
++	rp1_pad_update(pin, RP1_PAD_IN_ENABLE_MASK,
++		       value ? RP1_PAD_IN_ENABLE_MASK : 0);
++}
++
++static void rp1_output_enable(struct rp1_pin_info *pin, int value)
++{
++	rp1_pad_update(pin, RP1_PAD_OUT_DISABLE_MASK,
++		       value ? 0 : RP1_PAD_OUT_DISABLE_MASK);
++}
++
++static u32 rp1_get_fsel(struct rp1_pin_info *pin)
++{
++	u32 ctrl = readl(pin->gpio + RP1_GPIO_CTRL);
++	u32 oeover = FLD_GET(ctrl, RP1_GPIO_CTRL_OEOVER);
++	u32 fsel = FLD_GET(ctrl, RP1_GPIO_CTRL_FUNCSEL);
++
++	if (oeover != RP1_OEOVER_PERI || fsel >= RP1_FSEL_COUNT)
++		fsel = RP1_FSEL_NONE;
++
++	return fsel;
++}
++
++static void rp1_set_fsel(struct rp1_pin_info *pin, u32 fsel)
++{
++	u32 ctrl = readl(pin->gpio + RP1_GPIO_CTRL);
++
++	if (fsel >= RP1_FSEL_COUNT)
++		fsel = RP1_FSEL_NONE_HW;
++
++	rp1_input_enable(pin, 1);
++	rp1_output_enable(pin, 1);
++
++	if (fsel == RP1_FSEL_NONE) {
++		FLD_SET(ctrl, RP1_GPIO_CTRL_OEOVER, RP1_OEOVER_DISABLE);
++	} else {
++		FLD_SET(ctrl, RP1_GPIO_CTRL_OUTOVER, RP1_OUTOVER_PERI);
++		FLD_SET(ctrl, RP1_GPIO_CTRL_OEOVER, RP1_OEOVER_PERI);
++	}
++	FLD_SET(ctrl, RP1_GPIO_CTRL_FUNCSEL, fsel);
++
++	writel(ctrl, pin->gpio + RP1_GPIO_CTRL);
++}
++
++static int rp1_get_dir(struct rp1_pin_info *pin)
++{
++	return !(readl(pin->rio + RP1_RIO_OE) & (1 << pin->offset)) ?
++		RP1_DIR_INPUT : RP1_DIR_OUTPUT;
++}
++
++static void rp1_set_dir(struct rp1_pin_info *pin, bool is_input)
++{
++	int offset = is_input ? RP1_CLR_OFFSET : RP1_SET_OFFSET;
++
++	writel(1 << pin->offset, pin->rio + RP1_RIO_OE + offset);
++}
++
++static int rp1_get_value(struct rp1_pin_info *pin)
++{
++	return !!(readl(pin->rio + RP1_RIO_IN) & (1 << pin->offset));
++}
++
++static void rp1_set_value(struct rp1_pin_info *pin, int value)
++{
++	/* Assume the pin is already an output */
++	writel(1 << pin->offset,
++	       pin->rio + RP1_RIO_OUT + (value ? RP1_SET_OFFSET : RP1_CLR_OFFSET));
++}
++
++static int rp1_gpio_get(struct udevice *dev, unsigned int offset)
++{
++	struct rp1_pin_info *pin = rp1_get_pin(dev, offset);
++	int ret;
++
++	if (!pin)
++		return -EINVAL;
++
++	ret = rp1_get_value(pin);
++	return ret;
++}
++
++static int rp1_gpio_set(struct udevice *dev, unsigned int offset, int value)
++{
++	struct rp1_pin_info *pin = rp1_get_pin(dev, offset);
++
++	if (pin)
++		rp1_set_value(pin, value);
++
++	return 0;
++}
++
++static int rp1_gpio_direction_input(struct udevice *dev, unsigned int offset)
++{
++	struct rp1_pin_info *pin = rp1_get_pin(dev, offset);
++
++	if (!pin)
++		return -EINVAL;
++
++	rp1_set_dir(pin, RP1_DIR_INPUT);
++	rp1_set_fsel(pin, RP1_FSEL_GPIO);
++	return 0;
++}
++
++static int rp1_gpio_direction_output(struct udevice *dev, unsigned int offset, int value)
++{
++	struct rp1_pin_info *pin = rp1_get_pin(dev, offset);
++
++	if (!pin)
++		return -EINVAL;
++
++	rp1_set_value(pin, value);
++	rp1_set_dir(pin, RP1_DIR_OUTPUT);
++	rp1_set_fsel(pin, RP1_FSEL_GPIO);
++	return 0;
++}
++
++static int rp1_gpio_get_direction(struct udevice *dev, unsigned int offset)
++{
++	struct rp1_pin_info *pin = rp1_get_pin(dev, offset);
++	u32 fsel;
++
++	if (!pin)
++		return -EINVAL;
++
++	fsel = rp1_get_fsel(pin);
++	if (fsel != RP1_FSEL_GPIO)
++		return -EINVAL;
++
++	return (rp1_get_dir(pin) == RP1_DIR_OUTPUT) ?
++			GPIOF_OUTPUT :
++			GPIOF_INPUT;
++}
++
++static const struct dm_gpio_ops rp1_gpio_ops = {
++	.direction_input = rp1_gpio_direction_input,
++	.direction_output = rp1_gpio_direction_output,
++	.get_value = rp1_gpio_get,
++	.set_value = rp1_gpio_set,
++	.get_function = rp1_gpio_get_direction,
++};
++
++static int rp1_gpio_probe(struct udevice *dev)
++{
++	int i;
++	struct gpio_dev_priv *uc_priv = dev_get_uclass_priv(dev);
++	struct rp1_gpio_priv *priv = dev_get_priv(dev);
++
++	priv->gpio_base = dev_remap_addr_index(dev, 0);
++	if (!priv->gpio_base)
++		return -EINVAL;
++
++	priv->rio_base = dev_remap_addr_index(dev, 1);
++	if (!priv->rio_base)
++		return -EINVAL;
++
++	priv->pads_base = dev_remap_addr_index(dev, 2);
++	if (!priv->pads_base)
++		return -EINVAL;
++
++	uc_priv->gpio_count = RP1_NUM_GPIOS;
++	uc_priv->bank_name = dev->name;
++
++	for (i = 0; i < RP1_NUM_BANKS; i++) {
++		const struct rp1_iobank_desc *bank = &rp1_iobanks[i];
++		int j;
++
++		for (j = 0; j < bank->num_gpios; j++) {
++			struct rp1_pin_info *pin =
++				&priv->pins[bank->min_gpio + j];
++
++			pin->num = bank->min_gpio + j;
++			pin->bank = i;
++			pin->offset = j;
++
++			pin->gpio = priv->gpio_base + bank->gpio_offset +
++				    j * sizeof(u32) * 2;
++			pin->inte = priv->gpio_base + bank->inte_offset;
++			pin->ints = priv->gpio_base + bank->ints_offset;
++			pin->rio  = priv->rio_base + bank->rio_offset;
++			pin->pad  = priv->pads_base + bank->pads_offset +
++				    j * sizeof(u32);
++		}
++	}
++
++	return 0;
++}
++
++static const struct udevice_id rp1_gpio_ids[] = {
++	{ .compatible = "raspberrypi,rp1-gpio" },
++	{ /* sentinel */ }
++};
++
++U_BOOT_DRIVER(rp1_gpio) = {
++	.name = "rp1-gpio",
++	.id = UCLASS_GPIO,
++	.of_match = rp1_gpio_ids,
++	.ops = &rp1_gpio_ops,
++	.priv_auto	= sizeof(struct rp1_gpio_priv),
++	.probe = rp1_gpio_probe,
++};
+diff --git a/drivers/mfd/Kconfig b/drivers/mfd/Kconfig
+--- a/drivers/mfd/Kconfig
++++ b/drivers/mfd/Kconfig
+@@ -2,3 +2,13 @@
+ 	bool "Atmel Static Memory Controller driver"
+ 	help
+ 	  Say yes here to support Atmel Static Memory Controller driver.
++
++config MFD_RP1
++	tristate "RP1 MFD driver"
++	depends on PCI
++	help
++	  Support for the RP1 peripheral chip.
++
++	  This driver provides support for the Raspberry Pi RP1 peripheral chip.
++	  It is responsible for enabling the Device Tree node once the PCIe endpoint
++	  has been configureds.
+diff --git a/drivers/mfd/Makefile b/drivers/mfd/Makefile
+--- a/drivers/mfd/Makefile
++++ b/drivers/mfd/Makefile
+@@ -1 +1,2 @@
+ obj-$(CONFIG_MFD_ATMEL_SMC) += atmel-smc.o
++obj-$(CONFIG_MFD_RP1) += rp1.o
+diff --git a/drivers/mfd/rp1.c b/drivers/mfd/rp1.c
+new file mode 100644
+--- /dev/null
++++ b/drivers/mfd/rp1.c
+@@ -0,0 +1,133 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * Copyright (c) 2024 EPAM Systems
++ *
++ * Derived from linux rp1 driver
++ * Copyright (c) 2018-22 Raspberry Pi Ltd.
++ */
++
++#include <rpi5_diag.h>
++#include <asm/io.h>
++#include <dm.h>
++#include <dm/device_compat.h>
++#include <dm/of_access.h>
++#include <dt-bindings/mfd/rp1.h>
++#include <linux/io.h>
++#include <linux/types.h>
++#include <pci.h>
++
++#define RP1_B0_CHIP_ID 0x10001927
++#define RP1_C0_CHIP_ID 0x20001927
++
++#define RP1_PLATFORM_ASIC BIT(1)
++#define RP1_PLATFORM_FPGA BIT(0)
++
++#define RP1_DRIVER_NAME "rp1"
++
++#define PCI_DEVICE_REV_RP1_C0 2
++
++#define SYSINFO_CHIP_ID_OFFSET	0x00000000
++#define SYSINFO_PLATFORM_OFFSET	0x00000004
++
++struct rp1_dev {
++	phys_addr_t bar_start;
++};
++
++static inline dma_addr_t rp1_io_to_phys(struct rp1_dev *rp1, unsigned int offset)
++{
++	return rp1->bar_start + offset;
++}
++
++static u32 rp1_reg_read(struct rp1_dev *rp1, unsigned int base_addr, u32 offset)
++{
++	resource_size_t phys = rp1_io_to_phys(rp1, base_addr);
++	void __iomem *regblock = ioremap(phys, 0x1000);
++	u32 value = readl(regblock + offset);
++
++	iounmap(regblock);
++	return value;
++}
++
++static int rp1_get_bar_region(struct udevice *dev, phys_addr_t *bar_start)
++{
++	*bar_start = (phys_addr_t)dm_pci_map_bar(dev, PCI_BASE_ADDRESS_1, 0, 0,
++			PCI_REGION_TYPE, PCI_REGION_MEM);
++	return 0;
++}
++
++static int rp1_probe(struct udevice *dev)
++{
++	int ret;
++	struct rp1_dev *rp1 = dev_get_priv(dev);
++	u32 chip_id, platform;
++
++	rpi5_diag("RP1 PCI command / BAR setup");
++	/* Turn on bus-mastering */
++	dm_pci_clrset_config16(dev, PCI_COMMAND, 0, PCI_COMMAND_MASTER | PCI_COMMAND_MEMORY);
++
++	/*
++	 * HACK: Set bar address in the correct order.
++	 * Required for correct U-Boot operation.
++	 */
++	dm_pci_write_config32(dev, PCI_BASE_ADDRESS_1, 0);
++	dm_pci_write_config32(dev, PCI_BASE_ADDRESS_0, 0x40000);
++
++	rpi5_diag("RP1 map BAR");
++	ret = rp1_get_bar_region(dev, &rp1->bar_start);
++	if (ret)
++		return ret;
++
++	rpi5_diag("RP1 read chip ID");
++	/* Get chip id */
++	chip_id = rp1_reg_read(rp1, RP1_SYSINFO_BASE, SYSINFO_CHIP_ID_OFFSET);
++	rpi5_diag("RP1 read platform");
++	platform = rp1_reg_read(rp1, RP1_SYSINFO_BASE, SYSINFO_PLATFORM_OFFSET);
++	rpi5_diag("RP1 register reads finished");
++	dev_dbg(dev, "chip_id 0x%x%s\n", chip_id,
++		(platform & RP1_PLATFORM_FPGA) ? " FPGA" : "");
++
++	if (chip_id != RP1_C0_CHIP_ID) {
++		dev_err(dev, "wrong chip id (%x)\n", chip_id);
++		return -EINVAL;
++	}
++
++	return 0;
++}
++
++static int rp1_bind(struct udevice *dev)
++{
++	device_set_name(dev, RP1_DRIVER_NAME);
++	return 0;
++}
++
++static const struct pci_device_id dev_id_table[] = {
++	{ PCI_DEVICE(PCI_VENDOR_ID_RPI, PCI_DEVICE_ID_RPI_RP1_C0), },
++	{ 0, }
++};
++
++static int rp1_pcie_read_config(const struct udevice *bus, pci_dev_t bdf,
++				uint offset, ulong *valuep, enum pci_size_t size)
++{
++	/*
++	 * Leaving this call because pci subsystem calls for read_config
++	 * and produces error then this callback is not set.
++	 * Just return 0 here.s
++	 */
++	*valuep = 0;
++	return 0;
++}
++
++static const struct dm_pci_ops rp1_pcie_ops = {
++	.read_config	= rp1_pcie_read_config,
++};
++
++U_BOOT_DRIVER(rp1_driver) = {
++	.name			= RP1_DRIVER_NAME,
++	.id			= UCLASS_PCI_GENERIC,
++	.probe			= rp1_probe,
++	.bind			= rp1_bind,
++	.priv_auto		= sizeof(struct rp1_dev),
++	.ops			= &rp1_pcie_ops,
++};
++
++U_BOOT_PCI_DEVICE(rp1_driver, dev_id_table);
+diff --git a/drivers/net/Kconfig b/drivers/net/Kconfig
+--- a/drivers/net/Kconfig
++++ b/drivers/net/Kconfig
+@@ -586,6 +586,7 @@
+ 	bool "Cadence MACB/GEM Ethernet Interface"
+ 	depends on ARM || RISCV
+ 	select PHYLIB
++	select DM_GPIO
+ 	help
+ 	  The Cadence MACB ethernet interface is found on many Atmel
+ 	  AT91 and SAMA5 parts.  This driver also supports the Cadence
+diff --git a/drivers/net/macb.c b/drivers/net/macb.c
+--- a/drivers/net/macb.c
++++ b/drivers/net/macb.c
+@@ -2,10 +2,13 @@
+ /*
+  * Copyright (C) 2005-2006 Atmel Corporation
+  */
++#include <rpi5_diag.h>
+ #include <clk.h>
+ #include <cpu_func.h>
+ #include <dm.h>
++#include <dm/of_access.h>
+ #include <log.h>
++#include <asm/gpio.h>
+ #include <asm/global_data.h>
+ #include <linux/delay.h>
+ 
+@@ -38,14 +41,14 @@
+ #include <linux/mii.h>
+ #include <asm/io.h>
+ #include <linux/dma-mapping.h>
+-#include <linux/errno.h>
+-
+ /* Without CLK, we rely on the arch definition */
+ #if !defined(CONFIG_CLK)
+ #include <asm/arch/clk.h>
+ #endif
++#include <linux/errno.h>
+ 
+ #include "macb.h"
++#include "phys2bus.h"
+ 
+ DECLARE_GLOBAL_DATA_PTR;
+ 
+@@ -104,6 +107,8 @@ DECLARE_GLOBAL_DATA_PTR;
+ #define RXBUF_FRMLEN_MASK	0x00000fff
+ #define TXBUF_FRMLEN_MASK	0x000007ff
+ 
++#define msleep(x) udelay((x) * 1000)
++
+ struct macb_device {
+ 	void			*regs;
+ 
+@@ -143,6 +148,10 @@ struct macb_device {
+ 	unsigned long		pclk_rate;
+ #endif
+ 	phy_interface_t		phy_interface;
++
++	struct gpio_desc phy_reset_gpio;
++	int phy_reset_ms;
++	struct udevice *udev;
+ };
+ 
+ struct macb_usrio_cfg {
+@@ -274,47 +283,69 @@ struct macb_usrio_cfg {
+ 
+ 	arch_get_mdio_control(bus->name);
+ 	macb_mdio_write(macb, phy_adr, reg, value);
++	return 0;
++}
+ 
++static int macb_miiphy_reset(struct mii_dev *bus)
++{
++	struct macb_device *macb = bus->priv;
++
++	if (!dm_gpio_is_valid(&macb->phy_reset_gpio))
++		return 0;
++
++	dm_gpio_set_value(&macb->phy_reset_gpio, 1);
++	msleep(macb->phy_reset_ms);
++	dm_gpio_set_value(&macb->phy_reset_gpio, 0);
+ 	return 0;
+ }
+ #endif
+ 
+ #define RX	1
+ #define TX	0
++
++/*
++ * NOTE: To handle buffers - rx_ring and tx_ring addresses should be used instead
++ * of rx_buffer_dma and tx_buffer_dma. That is because on the several boards this
++ * controller could be connected via PCIe or similar instead of the direct connection.
++ * For example in BCM2712 macb controller is connected to RP1 chip via PCIe.
++ * When macb is connected directly to the SOC the rx_ring and tx_ring are the same
++ * as rx_buffer_dma and tx_buffer_dma.
++ */
++
+ static inline void macb_invalidate_ring_desc(struct macb_device *macb, bool rx)
+ {
+ 	if (rx)
+-		invalidate_dcache_range(macb->rx_ring_dma,
+-			ALIGN(macb->rx_ring_dma + MACB_RX_DMA_DESC_SIZE,
+-			      PKTALIGN));
++		invalidate_dcache_range((ulong)(macb->rx_ring), ALIGN((ulong)(macb->rx_ring) +
++					MACB_RX_DMA_DESC_SIZE, PKTALIGN));
+ 	else
+-		invalidate_dcache_range(macb->tx_ring_dma,
+-			ALIGN(macb->tx_ring_dma + MACB_TX_DMA_DESC_SIZE,
+-			      PKTALIGN));
++		invalidate_dcache_range((unsigned long)macb->tx_ring,
++					ALIGN((unsigned long)macb->tx_ring +
++					      MACB_TX_DMA_DESC_SIZE, PKTALIGN));
+ }
+ 
+ static inline void macb_flush_ring_desc(struct macb_device *macb, bool rx)
+ {
+ 	if (rx)
+-		flush_dcache_range(macb->rx_ring_dma, macb->rx_ring_dma +
+-				   ALIGN(MACB_RX_DMA_DESC_SIZE, PKTALIGN));
++		flush_dcache_range((ulong)(macb->rx_ring),
++				   (ulong)(macb->rx_ring) + ALIGN(MACB_RX_DMA_DESC_SIZE, PKTALIGN));
+ 	else
+-		flush_dcache_range(macb->tx_ring_dma, macb->tx_ring_dma +
++		flush_dcache_range((unsigned long)macb->tx_ring,
++				   (unsigned long)macb->tx_ring +
+ 				   ALIGN(MACB_TX_DMA_DESC_SIZE, PKTALIGN));
+ }
+ 
+ static inline void macb_flush_rx_buffer(struct macb_device *macb)
+ {
+-	flush_dcache_range(macb->rx_buffer_dma, macb->rx_buffer_dma +
+-			   ALIGN(macb->rx_buffer_size * MACB_RX_RING_SIZE,
+-				 PKTALIGN));
++	flush_dcache_range((ulong)macb->rx_buffer,
++			   (ulong)macb->rx_buffer +
++			   ALIGN(macb->rx_buffer_size * MACB_RX_RING_SIZE, PKTALIGN));
+ }
+ 
+ static inline void macb_invalidate_rx_buffer(struct macb_device *macb)
+ {
+-	invalidate_dcache_range(macb->rx_buffer_dma, macb->rx_buffer_dma +
+-				ALIGN(macb->rx_buffer_size * MACB_RX_RING_SIZE,
+-				      PKTALIGN));
++	invalidate_dcache_range((ulong)macb->rx_buffer,
++				(ulong)macb->rx_buffer +
++				ALIGN(macb->rx_buffer_size * MACB_RX_RING_SIZE, PKTALIGN));
+ }
+ 
+ #if defined(CONFIG_CMD_NET)
+@@ -340,12 +371,12 @@ static inline void macb_invalidate_rx_buffer(struct macb_device *macb)
+ static int _macb_send(struct macb_device *macb, const char *name, void *packet,
+ 		      int length)
+ {
+-	unsigned long paddr, ctrl;
++	unsigned long paddr, dmaaddr, ctrl;
+ 	unsigned int tx_head = macb->tx_head;
+ 	int i;
+ 
+ 	paddr = dma_map_single(packet, length, DMA_TO_DEVICE);
+-
++	dmaaddr = dev_phys_to_bus(macb->udev, paddr);
+ 	ctrl = length & TXBUF_FRMLEN_MASK;
+ 	ctrl |= MACB_BIT(TX_LAST);
+ 	if (tx_head == (MACB_TX_RING_SIZE - 1)) {
+@@ -359,7 +390,7 @@ static int _macb_send(struct macb_device *macb, const char *name, void *packet,
+ 		tx_head = tx_head * 2;
+ 
+ 	macb->tx_ring[tx_head].ctrl = ctrl;
+-	macb_set_addr(macb, &macb->tx_ring[tx_head], paddr);
++	macb_set_addr(macb, &macb->tx_ring[tx_head], dmaaddr);
+ 
+ 	barrier();
+ 	macb_flush_ring_desc(macb, TX);
+@@ -667,6 +698,22 @@ static int _macb_send(struct macb_device *macb, const char *name, void *packet,
+ 	return 0;
+ }
+ 
++static void gem_init_axi(struct macb_device *bp)
++{
++	u32 amp;
++
++	/* AXI pipeline setup - don't touch values unless specified in device
++	 * tree. Some hardware could have reset values > 1.
++	 */
++	amp = gem_readl(bp, AMP);
++
++	amp = GEM_BFINS(AW2B_FILL, 1 /*bp->use_aw2b_fill*/, amp);
++	amp = GEM_BFINS(AW2W_MAX_PIPE, 8, amp);
++	amp = GEM_BFINS(AR2R_MAX_PIPE, 8, amp);
++
++	gem_writel(bp, AMP, amp);
++}
++
+ static int macb_phy_init(struct udevice *dev, const char *name)
+ {
+ 	struct macb_device *macb = dev_get_priv(dev);
+@@ -838,8 +885,8 @@ static int macb_phy_init(struct udevice *dev, const char *name)
+ 
+ 	macb->dummy_desc->ctrl = MACB_BIT(TX_USED);
+ 	macb->dummy_desc->addr = 0;
+-	flush_dcache_range(macb->dummy_desc_dma, macb->dummy_desc_dma +
+-			ALIGN(MACB_TX_DUMMY_DMA_DESC_SIZE, PKTALIGN));
++	flush_dcache_range((ulong)macb->dummy_desc,
++			   (ulong)macb->dummy_desc + ALIGN(MACB_TX_DUMMY_DMA_DESC_SIZE, PKTALIGN));
+ 	paddr = macb->dummy_desc_dma;
+ 
+ 	for (i = 1; i < num_queues; i++) {
+@@ -943,6 +990,14 @@ static int macb_phy_init(struct udevice *dev, const char *name)
+ 		macb_writel(macb, TBQPH, upper_32_bits(macb->tx_ring_dma));
+ 	}
+ 
++	/*
++	 * Call axi bus init only for BCM2712 board which has macb
++	 * connected over PCIe.
++	 */
++	if (IS_ENABLED(CONFIG_TARGET_RPI_ARM64) &&
++	    of_machine_is_compatible("brcm,bcm2712"))
++		gem_init_axi(macb);
++
+ 	if (macb_is_gem(macb)) {
+ 		/* Initialize DMA properties */
+ 		gmac_configure_dma(macb);
+@@ -1122,7 +1177,7 @@ static int macb_phy_init(struct udevice *dev, const char *name)
+ 	}
+ }
+ 
+-static void _macb_eth_initialize(struct macb_device *macb)
++static void _macb_eth_initialize(struct macb_device *macb, struct udevice *dev)
+ {
+ 	int id = 0;	/* This is not used by functions we call */
+ 	u32 ncfgr;
+@@ -1136,13 +1191,23 @@ static void _macb_eth_initialize(struct macb_device *macb)
+ 	macb->rx_buffer = dma_alloc_coherent(macb->rx_buffer_size *
+ 					     MACB_RX_RING_SIZE,
+ 					     &macb->rx_buffer_dma);
++
++	macb->rx_buffer_dma = dev_phys_to_bus(dev, (ulong)macb->rx_buffer);
++
+ 	macb->rx_ring = dma_alloc_coherent(MACB_RX_DMA_DESC_SIZE,
+ 					   &macb->rx_ring_dma);
+-	macb->tx_ring = dma_alloc_coherent(MACB_TX_DMA_DESC_SIZE,
+-					   &macb->tx_ring_dma);
++
++	macb->rx_ring_dma = dev_phys_to_bus(dev, (ulong)macb->rx_ring);
++
++	macb->tx_ring = dma_alloc_coherent(MACB_TX_DMA_DESC_SIZE, &macb->tx_ring_dma);
++
++	macb->tx_ring_dma = dev_phys_to_bus(dev, (ulong)macb->tx_ring);
++
+ 	macb->dummy_desc = dma_alloc_coherent(MACB_TX_DUMMY_DMA_DESC_SIZE,
+ 					   &macb->dummy_desc_dma);
+ 
++	macb->dummy_desc_dma = dev_phys_to_bus(dev, (ulong)macb->dummy_desc);
++
+ 	/*
+ 	 * Do some basic initialization so that we at least can talk
+ 	 * to the PHY
+@@ -1216,11 +1281,19 @@ static void _macb_eth_initialize(struct macb_device *macb)
+ static int macb_enable_clk(struct udevice *dev)
+ {
+ 	struct macb_device *macb = dev_get_priv(dev);
+-	struct clk clk;
+-	ulong clk_rate;
++	struct clk clk, hclk;
++	struct clk tsu_clk;
+ 	int ret;
+ 
+-	ret = clk_get_by_index(dev, 0, &clk);
++	ret = clk_get_by_name(dev, "pclk", &clk);
++	if (ret)
++		return -EINVAL;
++
++	ret = clk_get_by_name_optional(dev, "hclk", &hclk);
++	if (ret)
++		return -EINVAL;
++
++	ret = clk_get_by_name_optional(dev, "tsu_clk", &tsu_clk);
+ 	if (ret)
+ 		return -EINVAL;
+ 
+@@ -1233,11 +1306,17 @@ static int macb_enable_clk(struct udevice *dev)
+ 	if (ret && ret != -ENOSYS)
+ 		return ret;
+ 
+-	clk_rate = clk_get_rate(&clk);
+-	if (!clk_rate)
+-		return -EINVAL;
++	ret = clk_enable(&hclk);
++	if (ret && ret != -ENOSYS)
++		return ret;
+ 
+-	macb->pclk_rate = clk_rate;
++	ret = clk_enable(&tsu_clk);
++	if (ret && ret != -ENOSYS)
++		return ret;
++
++	macb->pclk_rate = 0xbebc200;
++	if (!macb->pclk_rate)
++		return -EINVAL;
+ 
+ 	return 0;
+ }
+@@ -1264,10 +1343,12 @@ static int macb_enable_clk(struct udevice *dev)
+ 	struct ofnode_phandle_args phandle_args;
+ 	int ret;
+ 
++	rpi5_diag("MACB probe entered");
+ 	macb->phy_interface = dev_read_phy_mode(dev);
+ 	if (macb->phy_interface == PHY_INTERFACE_MODE_NA)
+ 		return -EINVAL;
+ 
++	macb->udev = dev;
+ 	/* Read phyaddr from DT */
+ 	if (!dev_read_phandle_with_args(dev, "phy-handle", NULL, 0, 0,
+ 					&phandle_args))
+@@ -1278,6 +1359,7 @@ static int macb_enable_clk(struct udevice *dev)
+ 
+ 	macb->is_big_endian = (cpu_to_be32(0x12345678) == 0x12345678);
+ 
++	rpi5_diag("MACB read capabilities");
+ 	macb->config = (struct macb_config *)dev_get_driver_data(dev);
+ 	if (!macb->config) {
+ 		if (IS_ENABLED(CONFIG_DMA_ADDR_T_64BIT)) {
+@@ -1288,22 +1370,37 @@ static int macb_enable_clk(struct udevice *dev)
+ 	}
+ 
+ #ifdef CONFIG_CLK
++	rpi5_diag("MACB enable clocks");
+ 	ret = macb_enable_clk(dev);
++	rpi5_diag_result("MACB clocks returned", ret);
+ 	if (ret)
+ 		return ret;
+ #endif
+ 
+-	_macb_eth_initialize(macb);
++	/* Resolve the PHY reset GPIO through its DT provider, not a global number. */
++	rpi5_diag("MACB PHY GPIO reset");
++	ret = phy_gpio_reset(dev);
++	rpi5_diag_result("MACB PHY reset returned", ret);
++	if (ret)
++		return ret;
++
++	rpi5_diag("MACB hardware init");
++	_macb_eth_initialize(macb, dev);
++	rpi5_diag("MACB hardware init returned");
+ 
+ #if defined(CONFIG_CMD_MII) || defined(CONFIG_PHYLIB)
+ 	macb->bus = mdio_alloc();
+ 	if (!macb->bus)
+ 		return -ENOMEM;
+ 	strlcpy(macb->bus->name, dev->name, MDIO_NAME_LEN);
++	macb->bus->priv = macb;
+ 	macb->bus->read = macb_miiphy_read;
+ 	macb->bus->write = macb_miiphy_write;
++	macb->bus->reset = macb_miiphy_reset;
+ 
++	rpi5_diag("MACB MDIO registration");
+ 	ret = mdio_register(macb->bus);
++	rpi5_diag_result("MACB MDIO returned", ret);
+ 	if (ret < 0)
+ 		return ret;
+ 	macb->bus = miiphy_get_dev_by_name(dev->name);
+@@ -1343,6 +1440,7 @@ static int macb_enable_clk(struct udevice *dev)
+ 	void *blob = (void *)gd->fdt_blob;
+ 	int node = dev_of_offset(dev);
+ 	int fl_node, speed_fdt;
++	int ret;
+ 
+ 	/* fetch 'fixed-link' property */
+ 	fl_node = fdt_subnode_offset(blob, node, "fixed-link");
+@@ -1368,6 +1466,16 @@ static int macb_enable_clk(struct udevice *dev)
+ 	if (!pdata->iobase)
+ 		return -EINVAL;
+ 
++	/* optional PHY reset-related properties */
++	ret = gpio_request_by_name(dev, "phy-reset-gpios", 0, &macb->phy_reset_gpio,
++				   GPIOD_IS_OUT);
++	if (ret && ret != -ENOENT) {
++		printf("Failed to obtain phy-reset gpio\n");
++		return ret;
++	}
++
++	macb->phy_reset_ms = ofnode_read_s32_default(dev_ofnode(dev), "phy-reset-duration", 10);
++
+ 	return macb_late_eth_of_to_plat(dev);
+ }
+ 
+diff --git a/drivers/net/macb.h b/drivers/net/macb.h
+--- a/drivers/net/macb.h
++++ b/drivers/net/macb.h
+@@ -69,6 +69,7 @@
+ #define GEM_USRIO		0x000c /* User IO */
+ #define GEM_DMACFG		0x0010 /* DMA Configuration */
+ #define GEM_JML			0x0048 /* Jumbo Max Length */
++#define GEM_AMP			0x0054 /* AXI Max Pipeline */
+ #define GEM_HRB			0x0080 /* Hash Bottom */
+ #define GEM_HRT			0x0084 /* Hash Top */
+ #define GEM_SA1B		0x0088 /* Specific1 Bottom */
+@@ -763,6 +764,21 @@
+ #define GEM_RX_CSUM_IP_TCP			2
+ #define GEM_RX_CSUM_IP_UDP			3
+ 
++/* Bitfields in AMP */
++/* Maximum number of outstanding AXI read requests */
++#define GEM_AR2R_MAX_PIPE_OFFSET		0
++#define GEM_AR2R_MAX_PIPE_SIZE			8
++/* Maximum number of outstanding AXI write requests */
++#define GEM_AW2W_MAX_PIPE_OFFSET		8
++#define GEM_AW2W_MAX_PIPE_SIZE 8
++/* Select whether the max AW2W transactions operates between: */
++#define GEM_AW2B_FILL_OFFSET			16
++/*   0: the AW to W AXI channel */
++#define GEM_AW2B_FILL_AW2W			0
++/*   1: AW to B channel */
++#define GEM_AW2B_FILL_AW2B			1
++#define GEM_AW2B_FILL_SIZE			1
++
+ /* limit RX checksum offload to TCP and UDP packets */
+ #define GEM_RX_CSUM_CHECKED_MASK		2
+ #define gem_writel_queue_TBQP(port, value, queue_num)	\
+diff --git a/drivers/usb/host/usb-uclass.c b/drivers/usb/host/usb-uclass.c
+--- a/drivers/usb/host/usb-uclass.c
++++ b/drivers/usb/host/usb-uclass.c
+@@ -8,6 +8,7 @@
+ 
+ #define LOG_CATEGORY UCLASS_USB
+ 
++#include <rpi5_diag.h>
+ #include <bootdev.h>
+ #include <uthread.h>
+ #include <dm.h>
+@@ -242,7 +243,9 @@
+ 
+ 	priv = dev_get_uclass_priv(bus);
+ 
++	rpi5_diag("USB device scan");
+ 	ret = usb_scan_device(bus, 0, USB_SPEED_FULL, &dev);
++	rpi5_diag_result("USB device scan returned", ret);
+ 	if (ret)
+ 		printf("Scanning bus %s failed, error %d\n", bus->name, ret);
+ }
+@@ -318,7 +321,9 @@
+ 		}
+ 	}
+ 
++	rpi5_diag("USB controller probe");
+ 	ret = device_probe(bus);
++	rpi5_diag_result("USB controller probe returned", ret);
+ 	if (ret == -ENODEV) {	/* No such device. */
+ 		printf("Bus %s: Port not available.\n", bus->name);
+ 		return;
+@@ -392,6 +397,7 @@
+ 
+ 	uthread_mutex_lock(&mutex);
+ 
++	rpi5_diag("USB init entered");
+ 	if (usb_started) {
+ 		ret = 0;
+ 		goto out;
+@@ -471,10 +477,11 @@
+ 
+ 	uthread_mutex_unlock(&mutex);
+ 
++	rpi5_diag_result("USB init returned", usb_started ? 0 : -ENOENT);
+ 	return usb_started ? 0 : -ENOENT;
+ out:
+ 	uthread_mutex_unlock(&mutex);
+-
++	rpi5_diag_result("USB init returned", ret);
+ 	return ret;
+ }
+ 
+diff --git a/drivers/video/video-uclass.c b/drivers/video/video-uclass.c
+--- a/drivers/video/video-uclass.c
++++ b/drivers/video/video-uclass.c
+@@ -5,6 +5,7 @@
+ 
+ #define LOG_CATEGORY UCLASS_VIDEO
+ 
++#include <rpi5_diag.h>
+ #include <bloblist.h>
+ #include <console.h>
+ #include <cpu_func.h>
+@@ -669,8 +670,10 @@
+ 	/* Set up colors  */
+ 	video_set_default_colors(dev, false);
+ 
++	rpi5_diag_video(dev, 301);
+ 	if (!CONFIG_IS_ENABLED(NO_FB_CLEAR))
+ 		video_clear(dev);
++	rpi5_diag_video(dev, 302);
+ 
+ 	/*
+ 	 * Create a text console device. For now we always do this, although
+@@ -705,12 +708,16 @@
+ 		return ret;
+ 	}
+ 
++	rpi5_diag_video(dev, 303);
+ 	ret = device_probe(cons);
+ 	if (ret) {
+ 		debug("%s: Cannot probe console driver\n", __func__);
+ 		return ret;
+ 	}
+ 
++	rpi5_diag_attach(cons);
++
++	rpi5_diag_video(dev, 305);
+ 	if (CONFIG_IS_ENABLED(VIDEO_LOGO) &&
+ 	    !CONFIG_IS_ENABLED(SPLASH_SCREEN) && !plat->hide_logo) {
+ 		u8 *data = video_get_u_boot_logo();
+@@ -720,6 +727,9 @@
+ 			log_debug("Cannot show splash screen (err=%dE)\n", ret);
+ 	}
+ 
++	rpi5_diag_video(dev, 306);
++
++	rpi5_diag_video(dev, 307);
+ 	/* register cyclic as soon as the first video device is probed */
+ 	if (CONFIG_IS_ENABLED(CYCLIC) && (gd->flags && GD_FLG_RELOC) &&
+ 	    !uc_priv->cyc_active) {
+@@ -730,6 +740,7 @@
+ 		uc_priv->cyc_active = true;
+ 	}
+ 
++	rpi5_diag_video(dev, 308);
+ 	return 0;
+ };
+ 
+diff --git a/include/dt-bindings/clk/rp1.h b/include/dt-bindings/clk/rp1.h
+new file mode 100644
+--- /dev/null
++++ b/include/dt-bindings/clk/rp1.h
+@@ -0,0 +1,56 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++/*
++ * Copyright (C) 2021 Raspberry Pi Ltd.
++ */
++
++#define RP1_PLL_SYS_CORE		0
++#define RP1_PLL_AUDIO_CORE		1
++#define RP1_PLL_VIDEO_CORE		2
++
++#define RP1_PLL_SYS			3
++#define RP1_PLL_AUDIO			4
++#define RP1_PLL_VIDEO			5
++
++#define RP1_PLL_SYS_PRI_PH		6
++#define RP1_PLL_SYS_SEC_PH		7
++#define RP1_PLL_AUDIO_PRI_PH		8
++
++#define RP1_PLL_SYS_SEC			9
++#define RP1_PLL_AUDIO_SEC		10
++#define RP1_PLL_VIDEO_SEC		11
++
++#define RP1_CLK_SYS			12
++#define RP1_CLK_SLOW_SYS		13
++#define RP1_CLK_DMA			14
++#define RP1_CLK_UART			15
++#define RP1_CLK_ETH			16
++#define RP1_CLK_PWM0			17
++#define RP1_CLK_PWM1			18
++#define RP1_CLK_AUDIO_IN		19
++#define RP1_CLK_AUDIO_OUT		20
++#define RP1_CLK_I2S			21
++#define RP1_CLK_MIPI0_CFG		22
++#define RP1_CLK_MIPI1_CFG		23
++#define RP1_CLK_PCIE_AUX		24
++#define RP1_CLK_USBH0_MICROFRAME	25
++#define RP1_CLK_USBH1_MICROFRAME	26
++#define RP1_CLK_USBH0_SUSPEND		27
++#define RP1_CLK_USBH1_SUSPEND		28
++#define RP1_CLK_ETH_TSU			29
++#define RP1_CLK_ADC			30
++#define RP1_CLK_SDIO_TIMER		31
++#define RP1_CLK_SDIO_ALT_SRC		32
++#define RP1_CLK_GP0			33
++#define RP1_CLK_GP1			34
++#define RP1_CLK_GP2			35
++#define RP1_CLK_GP3			36
++#define RP1_CLK_GP4			37
++#define RP1_CLK_GP5			38
++#define RP1_CLK_VEC			39
++#define RP1_CLK_DPI			40
++#define RP1_CLK_MIPI0_DPI		41
++#define RP1_CLK_MIPI1_DPI		42
++
++/* Extra PLL output channels - RP1B0 only */
++#define RP1_PLL_VIDEO_PRI_PH		43
++#define RP1_PLL_AUDIO_TERN		44
+diff --git a/include/dt-bindings/mfd/rp1.h b/include/dt-bindings/mfd/rp1.h
+new file mode 100644
+--- /dev/null
++++ b/include/dt-bindings/mfd/rp1.h
+@@ -0,0 +1,239 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++/*
++ * This header provides constants for the PY MFD.
++ *
++ * Copyright (c) 2024 EPAM Systems
++ *
++ * Derived from linux rp1.h.
++ */
++
++#ifndef _RP1_H
++#define _RP1_H
++
++/* Address map */
++#define RP1_SYSINFO_BASE 0x000000
++#define RP1_TBMAN_BASE 0x004000
++#define RP1_SYSCFG_BASE 0x008000
++#define RP1_OTP_BASE 0x00c000
++#define RP1_POWER_BASE 0x010000
++#define RP1_RESETS_BASE 0x014000
++#define RP1_CLOCKS_BANK_DEFAULT_BASE 0x018000
++#define RP1_CLOCKS_BANK_VIDEO_BASE 0x01c000
++#define RP1_PLL_SYS_BASE 0x020000
++#define RP1_PLL_AUDIO_BASE 0x024000
++#define RP1_PLL_VIDEO_BASE 0x028000
++#define RP1_UART0_BASE 0x030000
++#define RP1_UART1_BASE 0x034000
++#define RP1_UART2_BASE 0x038000
++#define RP1_UART3_BASE 0x03c000
++#define RP1_UART4_BASE 0x040000
++#define RP1_UART5_BASE 0x044000
++#define RP1_SPI8_BASE 0x04c000
++#define RP1_SPI0_BASE 0x050000
++#define RP1_SPI1_BASE 0x054000
++#define RP1_SPI2_BASE 0x058000
++#define RP1_SPI3_BASE 0x05c000
++#define RP1_SPI4_BASE 0x060000
++#define RP1_SPI5_BASE 0x064000
++#define RP1_SPI6_BASE 0x068000
++#define RP1_SPI7_BASE 0x06c000
++#define RP1_I2C0_BASE 0x070000
++#define RP1_I2C1_BASE 0x074000
++#define RP1_I2C2_BASE 0x078000
++#define RP1_I2C3_BASE 0x07c000
++#define RP1_I2C4_BASE 0x080000
++#define RP1_I2C5_BASE 0x084000
++#define RP1_I2C6_BASE 0x088000
++#define RP1_AUDIO_IN_BASE 0x090000
++#define RP1_AUDIO_OUT_BASE 0x094000
++#define RP1_PWM0_BASE 0x098000
++#define RP1_PWM1_BASE 0x09c000
++#define RP1_I2S0_BASE 0x0a0000
++#define RP1_I2S1_BASE 0x0a4000
++#define RP1_I2S2_BASE 0x0a8000
++#define RP1_TIMER_BASE 0x0ac000
++#define RP1_SDIO0_APBS_BASE 0x0b0000
++#define RP1_SDIO1_APBS_BASE 0x0b4000
++#define RP1_BUSFABRIC_MONITOR_BASE 0x0c0000
++#define RP1_BUSFABRIC_AXISHIM_BASE 0x0c4000
++#define RP1_ADC_BASE 0x0c8000
++#define RP1_IO_BANK0_BASE 0x0d0000
++#define RP1_IO_BANK1_BASE 0x0d4000
++#define RP1_IO_BANK2_BASE 0x0d8000
++#define RP1_SYS_RIO0_BASE 0x0e0000
++#define RP1_SYS_RIO1_BASE 0x0e4000
++#define RP1_SYS_RIO2_BASE 0x0e8000
++#define RP1_PADS_BANK0_BASE 0x0f0000
++#define RP1_PADS_BANK1_BASE 0x0f4000
++#define RP1_PADS_BANK2_BASE 0x0f8000
++#define RP1_PADS_ETH_BASE 0x0fc000
++#define RP1_ETH_IP_BASE 0x100000
++#define RP1_ETH_CFG_BASE 0x104000
++#define RP1_PCIE_APBS_BASE 0x108000
++#define RP1_MIPI0_CSIDMA_BASE 0x110000
++#define RP1_MIPI0_CSIHOST_BASE 0x114000
++#define RP1_MIPI0_DSIDMA_BASE 0x118000
++#define RP1_MIPI0_DSIHOST_BASE 0x11c000
++#define RP1_MIPI0_MIPICFG_BASE 0x120000
++#define RP1_MIPI0_ISP_BASE 0x124000
++#define RP1_MIPI1_CSIDMA_BASE 0x128000
++#define RP1_MIPI1_CSIHOST_BASE 0x12c000
++#define RP1_MIPI1_DSIDMA_BASE 0x130000
++#define RP1_MIPI1_DSIHOST_BASE 0x134000
++#define RP1_MIPI1_MIPICFG_BASE 0x138000
++#define RP1_MIPI1_ISP_BASE 0x13c000
++#define RP1_VIDEO_OUT_CFG_BASE 0x140000
++#define RP1_VIDEO_OUT_VEC_BASE 0x144000
++#define RP1_VIDEO_OUT_DPI_BASE 0x148000
++#define RP1_XOSC_BASE 0x150000
++#define RP1_WATCHDOG_BASE 0x154000
++#define RP1_DMA_TICK_BASE 0x158000
++#define RP1_SDIO_CLOCKS_BASE 0x15c000
++#define RP1_USBHOST0_APBS_BASE 0x160000
++#define RP1_USBHOST1_APBS_BASE 0x164000
++#define RP1_ROSC0_BASE 0x168000
++#define RP1_ROSC1_BASE 0x16c000
++#define RP1_VBUSCTRL_BASE 0x170000
++#define RP1_TICKS_BASE 0x174000
++#define RP1_PIO_APBS_BASE 0x178000
++#define RP1_SDIO0_AHBLS_BASE 0x180000
++#define RP1_SDIO1_AHBLS_BASE 0x184000
++#define RP1_DMA_BASE 0x188000
++#define RP1_RAM_BASE 0x1c0000
++#define RP1_RAM_SIZE 0x020000
++#define RP1_USBHOST0_AXIS_BASE 0x200000
++#define RP1_USBHOST1_AXIS_BASE 0x300000
++#define RP1_EXAC_BASE 0x400000
++
++/* Interrupts */
++
++#define RP1_INT_IO_BANK0 0
++#define RP1_INT_IO_BANK1 1
++#define RP1_INT_IO_BANK2 2
++#define RP1_INT_AUDIO_IN 3
++#define RP1_INT_AUDIO_OUT 4
++#define RP1_INT_PWM0 5
++#define RP1_INT_ETH 6
++#define RP1_INT_I2C0 7
++#define RP1_INT_I2C1 8
++#define RP1_INT_I2C2 9
++#define RP1_INT_I2C3 10
++#define RP1_INT_I2C4 11
++#define RP1_INT_I2C5 12
++#define RP1_INT_I2C6 13
++#define RP1_INT_I2S0 14
++#define RP1_INT_I2S1 15
++#define RP1_INT_I2S2 16
++#define RP1_INT_SDIO0 17
++#define RP1_INT_SDIO1 18
++#define RP1_INT_SPI0 19
++#define RP1_INT_SPI1 20
++#define RP1_INT_SPI2 21
++#define RP1_INT_SPI3 22
++#define RP1_INT_SPI4 23
++#define RP1_INT_SPI5 24
++#define RP1_INT_UART0 25
++#define RP1_INT_TIMER_0 26
++#define RP1_INT_TIMER_1 27
++#define RP1_INT_TIMER_2 28
++#define RP1_INT_TIMER_3 29
++#define RP1_INT_USBHOST0 30
++#define RP1_INT_USBHOST0_0 31
++#define RP1_INT_USBHOST0_1 32
++#define RP1_INT_USBHOST0_2 33
++#define RP1_INT_USBHOST0_3 34
++#define RP1_INT_USBHOST1 35
++#define RP1_INT_USBHOST1_0 36
++#define RP1_INT_USBHOST1_1 37
++#define RP1_INT_USBHOST1_2 38
++#define RP1_INT_USBHOST1_3 39
++#define RP1_INT_DMA 40
++#define RP1_INT_PWM1 41
++#define RP1_INT_UART1 42
++#define RP1_INT_UART2 43
++#define RP1_INT_UART3 44
++#define RP1_INT_UART4 45
++#define RP1_INT_UART5 46
++#define RP1_INT_MIPI0 47
++#define RP1_INT_MIPI1 48
++#define RP1_INT_VIDEO_OUT 49
++#define RP1_INT_PIO_0 50
++#define RP1_INT_PIO_1 51
++#define RP1_INT_ADC_FIFO 52
++#define RP1_INT_PCIE_OUT 53
++#define RP1_INT_SPI6 54
++#define RP1_INT_SPI7 55
++#define RP1_INT_SPI8 56
++#define RP1_INT_SYSCFG 58
++#define RP1_INT_CLOCKS_DEFAULT 59
++#define RP1_INT_VBUSCTRL 60
++#define RP1_INT_PROC_MISC 57
++#define RP1_INT_END 61
++
++/* DMA peripherals (for pacing) */
++#define RP1_DMA_I2C0_RX 0x0
++#define RP1_DMA_I2C0_TX 0x1
++#define RP1_DMA_I2C1_RX 0x2
++#define RP1_DMA_I2C1_TX 0x3
++#define RP1_DMA_I2C2_RX 0x4
++#define RP1_DMA_I2C2_TX 0x5
++#define RP1_DMA_I2C3_RX 0x6
++#define RP1_DMA_I2C3_TX 0x7
++#define RP1_DMA_I2C4_RX 0x8
++#define RP1_DMA_I2C4_TX 0x9
++#define RP1_DMA_I2C5_RX 0xa
++#define RP1_DMA_I2C5_TX 0xb
++#define RP1_DMA_SPI0_RX 0xc
++#define RP1_DMA_SPI0_TX 0xd
++#define RP1_DMA_SPI1_RX 0xe
++#define RP1_DMA_SPI1_TX 0xf
++#define RP1_DMA_SPI2_RX 0x10
++#define RP1_DMA_SPI2_TX 0x11
++#define RP1_DMA_SPI3_RX 0x12
++#define RP1_DMA_SPI3_TX 0x13
++#define RP1_DMA_SPI4_RX 0x14
++#define RP1_DMA_SPI4_TX 0x15
++#define RP1_DMA_SPI5_RX 0x16
++#define RP1_DMA_SPI5_TX 0x17
++#define RP1_DMA_PWM0 0x18
++#define RP1_DMA_UART0_RX 0x19
++#define RP1_DMA_UART0_TX 0x1a
++#define RP1_DMA_AUDIO_IN_CH0 0x1b
++#define RP1_DMA_AUDIO_IN_CH1 0x1c
++#define RP1_DMA_AUDIO_OUT 0x1d
++#define RP1_DMA_PWM1 0x1e
++#define RP1_DMA_I2S0_RX 0x1f
++#define RP1_DMA_I2S0_TX 0x20
++#define RP1_DMA_I2S1_RX 0x21
++#define RP1_DMA_I2S1_TX 0x22
++#define RP1_DMA_I2S2_RX 0x23
++#define RP1_DMA_I2S2_TX 0x24
++#define RP1_DMA_UART1_RX 0x25
++#define RP1_DMA_UART1_TX 0x26
++#define RP1_DMA_UART2_RX 0x27
++#define RP1_DMA_UART2_TX 0x28
++#define RP1_DMA_UART3_RX 0x29
++#define RP1_DMA_UART3_TX 0x2a
++#define RP1_DMA_UART4_RX 0x2b
++#define RP1_DMA_UART4_TX 0x2c
++#define RP1_DMA_UART5_RX 0x2d
++#define RP1_DMA_UART5_TX 0x2e
++#define RP1_DMA_ADC 0x2f
++#define RP1_DMA_DMA_TICK_TICK0 0x30
++#define RP1_DMA_DMA_TICK_TICK1 0x31
++#define RP1_DMA_SPI6_RX 0x32
++#define RP1_DMA_SPI6_TX 0x33
++#define RP1_DMA_SPI7_RX 0x34
++#define RP1_DMA_SPI7_TX 0x35
++#define RP1_DMA_SPI8_RX 0x36
++#define RP1_DMA_SPI8_TX 0x37
++#define RP1_DMA_PIO_CH0_TX 0x38
++#define RP1_DMA_PIO_CH0_RX 0x39
++#define RP1_DMA_PIO_CH1_TX 0x3a
++#define RP1_DMA_PIO_CH1_RX 0x3b
++#define RP1_DMA_PIO_CH2_TX 0x3c
++#define RP1_DMA_PIO_CH2_RX 0x3d
++#define RP1_DMA_PIO_CH3_TX 0x3e
++#define RP1_DMA_PIO_CH3_RX 0x3f
++
++#endif
+diff --git a/include/pci_ids.h b/include/pci_ids.h
+--- a/include/pci_ids.h
++++ b/include/pci_ids.h
+@@ -2555,6 +2555,9 @@
+ #define PCI_VENDOR_ID_TEKRAM		0x1de1
+ #define PCI_DEVICE_ID_TEKRAM_DC290	0xdc29
+ 
++#define PCI_VENDOR_ID_RPI		0x1de4
++#define PCI_DEVICE_ID_RPI_RP1_C0		0x0001
++
+ #define PCI_VENDOR_ID_TEHUTI		0x1fc9
+ #define PCI_DEVICE_ID_TEHUTI_3009	0x3009
+ #define PCI_DEVICE_ID_TEHUTI_3010	0x3010
+diff --git a/include/rpi5_diag.h b/include/rpi5_diag.h
+new file mode 100644
+--- /dev/null
++++ b/include/rpi5_diag.h
+@@ -0,0 +1,19 @@
++/* SPDX-License-Identifier: GPL-2.0+ */
++#ifndef __RPI5_DIAG_H
++#define __RPI5_DIAG_H
++
++struct udevice;
++
++#if 0 /* Diagnostic drawing disabled; keep console routing unchanged. */
++void rpi5_diag_video(struct udevice *video, unsigned int stage);
++void rpi5_diag_attach(struct udevice *console);
++void rpi5_diag(const char *message);
++void rpi5_diag_result(const char *message, int result);
++#else
++static inline void rpi5_diag_video(struct udevice *video, unsigned int stage) {}
++static inline void rpi5_diag_attach(struct udevice *console) {}
++static inline void rpi5_diag(const char *message) {}
++static inline void rpi5_diag_result(const char *message, int result) {}
++#endif
++
++#endif
+diff --git a/test/dm/ofnode.c b/test/dm/ofnode.c
+--- a/test/dm/ofnode.c
++++ b/test/dm/ofnode.c
+@@ -193,7 +193,7 @@
+ static int dm_test_ofnode_by_prop_value(struct unit_test_state *uts)
+ {
+ 	ut_assertok(check_prop_values(uts, ofnode_null(), "compatible",
+-				      "denx,u-boot-fdt-test", 11));
++				      "denx,u-boot-fdt-test", 12));
+ 
+ 	return 0;
+ }
+@@ -1263,7 +1263,7 @@ static int dm_test_ofnode_by_prop_value(struct unit_test_state *uts)
+ 	for (node = ofnode_null();
+ 	     node = ofnode_by_compatible(node, compat), ofnode_valid(node);)
+ 		count++;
+-	ut_asserteq(11, count);
++	ut_asserteq(12, count);
+ 
+ 	return 0;
+ }
+diff --git a/test/dm/phys2bus.c b/test/dm/phys2bus.c
+--- a/test/dm/phys2bus.c
++++ b/test/dm/phys2bus.c
+@@ -31,6 +31,38 @@
+ 	ut_asserteq_addr((void*)0x1003ffffULL, (void*)dev_phys_to_bus(dev, 0x3ffff));
+ 	ut_asserteq_addr((void*)0x3ffffULL, (void*)(ulong)dev_bus_to_phys(dev, 0x1003ffff));
+ 
++#if CONFIG_IS_ENABLED(OF_REAL)
++	if (uts->of_live) {
++		/* DMA-ranges are to be found on the grandparent bus node,
++		 * DT nodes neither here nor at parent.
++		 */
++		struct udevice *pdev;
++		ofnode psave, nsave;
++
++		node = ofnode_path("/mmio-bus@0/bus@7");
++		ut_assert(ofnode_valid(node));
++		ut_assertok(uclass_get_device_by_ofnode(UCLASS_TEST_BUS, node, &pdev));
++
++		/* pretend the devices were discovered dynamically and have no DT node */
++		psave = pdev->node_;
++		pdev->node_.np = NULL;
++
++		node = ofnode_path("/mmio-bus@0/bus@7/subnode@8");
++		ut_assert(ofnode_valid(node));
++		ut_assertok(uclass_get_device_by_ofnode(UCLASS_TEST_FDT, node, &dev));
++
++		nsave = dev->node_;
++		dev->node_.np = NULL;
++
++		ut_asserteq_ptr((void *)0x1003ffffULL,
++				(void *)dev_phys_to_bus(dev, 0x3ffffULL));
++		ut_asserteq_ptr((void *)0x3ffffULL,
++				(void *)(ulong)dev_bus_to_phys(dev, 0x1003ffff));
++
++		pdev->node_ = psave;
++		dev->node_ = nsave;
++	}
++#endif
+ 	return 0;
+ }
+ DM_TEST(dm_test_phys_to_bus, UTF_SCAN_PDATA | UTF_SCAN_FDT);
